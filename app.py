@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, session
 import sqlite3, os
+from azure.storage.queue import QueueClient   # NEW import
 
 app = Flask(__name__)
 app.secret_key = "secret-key-123"  # You can change this to any random string
@@ -18,6 +19,7 @@ def get_db_connection():
 def init_db():
     os.makedirs("database", exist_ok=True)
     conn = get_db_connection()
+    # Products table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,8 +28,29 @@ def init_db():
             stock INTEGER DEFAULT 0
         )
     """)
+    # Orders table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            total REAL,
+            payment_type TEXT,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
+
+# -------------------------------------------------------
+# QUEUE SERVICE
+# -------------------------------------------------------
+def enqueue_order(order_id: int):
+    queue_client = QueueClient.from_connection_string(
+        conn_str=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
+        queue_name="orders-queue"
+    )
+    queue_client.send_message(str(order_id))
+    print(f"Order {order_id} placed into queue")
 
 # -------------------------------------------------------
 # HOME PAGE – DISPLAY PRODUCTS
@@ -110,99 +133,29 @@ def remove_from_cart(product_id):
     return redirect(url_for("cart"))
 
 # -------------------------------------------------------
-# CHECKOUT
+# CHECKOUT (UPDATED)
 # -------------------------------------------------------
 @app.route("/checkout", methods=["GET", "POST"])
 def checkout():
     if request.method == "POST":
         payment_type = request.form.get("payment_type")
         total = float(request.form.get("total", 0))
-        session.pop("cart", None)
-        return render_template("checkout.html", total=total, payment_type=payment_type)
-    else:
         cart = session.get("cart", [])
-        total = sum(item["price"] * item["quantity"] for item in cart)
-        return render_template("checkout.html", total=total, payment_type=None)
 
-# -------------------------------------------------------
-# ADMIN LOGIN
-# -------------------------------------------------------
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
-
-        if username == "admin" and password == "admin123":
-            session["admin_logged_in"] = True
-            return redirect(url_for("manage_products"))
-        else:
-            return render_template("admin_login.html", error="Invalid credentials")
-
-    return render_template("admin_login.html", error=None)
-
-# -------------------------------------------------------
-# ADMIN LOGOUT
-# -------------------------------------------------------
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("admin_logged_in", None)
-    return redirect(url_for("admin_login"))
-
-# -------------------------------------------------------
-# ADMIN - ADD PRODUCT
-# -------------------------------------------------------
-@app.route("/admin/add_product", methods=["GET", "POST"])
-def add_product():
-    if not session.get("admin_logged_in"):
-        return redirect(url_for("admin_login"))
-
-    if request.method == "POST":
-        name = request.form["name"]
-        price = float(request.form["price"])
-        stock = int(request.form["stock"])
-
+        # Save order in DB with status = Pending
         conn = get_db_connection()
-        conn.execute("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)",
-                     (name, price, stock))
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO orders (total, payment_type, status) VALUES (?, ?, ?)",
+                       (total, payment_type, "Pending"))
+        order_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
-        return redirect(url_for("manage_products"))
+        # Enqueue order ID for async processing
+        enqueue_order(order_id)
 
-    return render_template("add_product.html")
+        # Clear cart
+        session.pop("cart", None)
 
-# -------------------------------------------------------
-# ADMIN - MANAGE PRODUCTS
-# -------------------------------------------------------
-@app.route("/admin/manage_products")
-def manage_products():
-    if not session.get("admin_logged_in"):
-        return redirect(url_for("admin_login"))
-
-    conn = get_db_connection()
-    products = conn.execute("SELECT * FROM products").fetchall()
-    conn.close()
-    return render_template("manage_products.html", products=products)
-
-# -------------------------------------------------------
-# ADMIN - DELETE PRODUCT
-# -------------------------------------------------------
-@app.route("/admin/delete_product/<int:product_id>")
-def delete_product(product_id):
-    if not session.get("admin_logged_in"):
-        return redirect(url_for("admin_login"))
-
-    conn = get_db_connection()
-    conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    conn.commit()
-    conn.close()
-    return redirect(url_for("manage_products"))
-
-# -------------------------------------------------------
-# START APP
-# -------------------------------------------------------
-if __name__ == "__main__":
-    init_db()  # Ensure DB and table exist
-    app.run(debug=True)
-
+        return render_template("checkout.html", total=total, payment_type=payment_type, order_id=order_id)
+    else:
