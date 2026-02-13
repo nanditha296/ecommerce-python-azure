@@ -1,9 +1,9 @@
 from flask import Flask, render_template, request, redirect, url_for, session
 import sqlite3, os
-from azure.storage.queue import QueueClient   # NEW import
+from azure.storage.queue import QueueClient
 
 app = Flask(__name__)
-app.secret_key = "secret-key-123"  # You can change this to any random string
+app.secret_key = "secret-key-123"  # Change to a random string for production
 
 # -------------------------------------------------------
 # DATABASE CONNECTION
@@ -45,12 +45,19 @@ def init_db():
 # QUEUE SERVICE
 # -------------------------------------------------------
 def enqueue_order(order_id: int):
-    queue_client = QueueClient.from_connection_string(
-        conn_str=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
-        queue_name="orders-queue"
-    )
-    queue_client.send_message(str(order_id))
-    print(f"Order {order_id} placed into queue")
+    try:
+        connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        if not connection_string:
+            print("AZURE_STORAGE_CONNECTION_STRING not set")
+            return
+        queue_client = QueueClient.from_connection_string(
+            conn_str=connection_string,
+            queue_name="orders-queue"
+        )
+        queue_client.send_message(str(order_id))
+        print(f"Order {order_id} placed into queue")
+    except Exception as e:
+        print(f"Error enqueuing order: {e}")
 
 # -------------------------------------------------------
 # HOME PAGE – DISPLAY PRODUCTS
@@ -133,7 +140,7 @@ def remove_from_cart(product_id):
     return redirect(url_for("cart"))
 
 # -------------------------------------------------------
-# CHECKOUT (UPDATED)
+# CHECKOUT
 # -------------------------------------------------------
 @app.route("/checkout", methods=["GET", "POST"])
 def checkout():
@@ -145,8 +152,10 @@ def checkout():
         # Save order in DB with status = Pending
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO orders (total, payment_type, status) VALUES (?, ?, ?)",
-                       (total, payment_type, "Pending"))
+        cursor.execute(
+            "INSERT INTO orders (total, payment_type, status) VALUES (?, ?, ?)",
+            (total, payment_type, "Pending")
+        )
         order_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -157,5 +166,21 @@ def checkout():
         # Clear cart
         session.pop("cart", None)
 
-        return render_template("checkout.html", total=total, payment_type=payment_type, order_id=order_id)
+        return render_template(
+            "checkout.html",
+            total=total,
+            payment_type=payment_type,
+            order_id=order_id
+        )
     else:
+        # GET request → show checkout page with cart summary
+        cart = session.get("cart", [])
+        total = sum(item["price"] * item["quantity"] for item in cart)
+        return render_template("checkout.html", cart=cart, total=total)
+
+# -------------------------------------------------------
+# MAIN ENTRY
+# -------------------------------------------------------
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=8000)
